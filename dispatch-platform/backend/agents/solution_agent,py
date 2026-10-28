@@ -1,0 +1,33 @@
+import json
+import time
+from openai import OpenAI
+from backend.config import settings
+
+class SolutionAgent:
+    def __init__(self, client: OpenAI):
+        self.client = client
+
+    def process(self, graph_dict: dict, bitstring: str) -> tuple[dict, int]:
+        start = time.perf_counter()
+        prompt = (
+            "Map the following optimal bitstring resulting from a quantum QAOA simulation "
+            "back to vehicle routes, node partitions, and operational instructions.\n"
+            f"GRAPH: {json.dumps(graph_dict)}\n"
+            f"BITSTRING: {bitstring}\n\n"
+            "Output JSON with keys:\n"
+            "  'routes': list of lists of node IDs per vehicle\n"
+            "  'mileage_savings_pct': float\n"
+            "  'summary': string explaining route allocation"
+        )
+        response = self.client.chat.completions.create(
+            model=settings.MODEL_NANO,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. Do not wrap in markdown tags."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        data = json.loads(response.choices[0].message.content)
+        return data, latency_ms

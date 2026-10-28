@@ -1,0 +1,1231 @@
+# ==============================================================================
+# MASTER PRODUCTION SPECIFICATION & IMPLEMENTATION BLUEPRINT
+# Project: Quantum-Classical Fleet Dispatch Platform
+# Stack: C++20/Qt6 Native GUI + Next.js 14 Web + FastAPI Gateway + 
+#        NVIDIA Nemotron (Nebius Token Factory) + NVIDIA CUDA-Q + Supabase (RLS)
+# ==============================================================================
+
+TASK INSTRUCTIONS:
+Construct the entire production codebase from this document. Every file, schema,
+script, and interface must be generated with full, working implementations. 
+Do not omit methods, truncate code, or use placeholders.
+
+
+================================================================================
+SECTION 1: ENVIRONMENT CONFIGURATION & BUILD SCRIPTS
+================================================================================
+
+--- FILE: .env.example ---
+# Nebius AI Cloud / Token Factory
+NEBIUS_API_KEY=your_nebius_api_key_here
+NEBIUS_BASE_URL=https://api.tokenfactory.nebius.com/v1/
+
+# Supabase Credentials
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_KEY=your_service_role_key_here
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_anon_public_key_here
+
+# Services Networking
+CLOUD_WORKER_URL=http://localhost:8000
+BACKEND_GATEWAY_URL=http://localhost:8765
+
+
+--- FILE: CMakeLists.txt ---
+cmake_minimum_required(VERSION 3.20)
+project(QuantumDispatchGUI LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network Charts)
+
+include_directories(gui/include)
+
+set(SOURCES
+    gui/src/main.cpp
+    gui/src/main_window.cpp
+    gui/src/auth_dialog.cpp
+    gui/src/cloud_sync.cpp
+    gui/src/local_runner.cpp
+)
+
+set(HEADERS
+    gui/include/main_window.hpp
+    gui/include/auth_dialog.hpp
+    gui/include/cloud_sync.hpp
+    gui/include/local_runner.hpp
+)
+
+add_executable(quantum_dispatch_gui ${SOURCES} ${HEADERS})
+
+target_link_libraries(quantum_dispatch_gui PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Network
+    Qt6::Charts
+)
+
+
+================================================================================
+SECTION 2: DATABASE MIGRATIONS & ROW-LEVEL SECURITY
+================================================================================
+
+--- FILE: database/migrations.sql ---
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE TABLE IF NOT EXISTS public.dispatch_runs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    title TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')),
+    compute_target TEXT NOT NULL CHECK (compute_target IN ('LOCAL_GPU', 'NEBIUS_CLOUD')),
+    raw_payload JSONB NOT NULL,
+    graph_data JSONB,
+    hamiltonian_spec JSONB,
+    optimal_bitstring TEXT,
+    solution_json JSONB,
+    telemetry JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_runs_user_id ON public.dispatch_runs(user_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_runs_created_at ON public.dispatch_runs(created_at DESC);
+
+ALTER TABLE public.dispatch_runs ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view their own dispatch runs" 
+ON public.dispatch_runs FOR SELECT 
+USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can create their own dispatch runs" 
+ON public.dispatch_runs FOR INSERT 
+WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update their own dispatch runs" 
+ON public.dispatch_runs FOR UPDATE 
+USING (auth.uid() = user_id);
+
+
+================================================================================
+SECTION 3: BACKEND API GATEWAY & NEMOTRON AGENTS
+================================================================================
+
+--- FILE: backend/requirements.txt ---
+fastapi==0.115.0
+uvicorn==0.31.0
+openai>=1.47.0
+supabase==2.8.0
+pydantic==2.9.2
+networkx==3.3
+numpy==1.26.4
+requests==2.32.3
+pytest==8.3.3
+
+
+--- FILE: backend/config.py ---
+import os
+from pydantic import BaseModel
+
+class Settings(BaseModel):
+    NEBIUS_API_KEY: str = os.getenv("NEBIUS_API_KEY", "")
+    NEBIUS_BASE_URL: str = os.getenv("NEBIUS_BASE_URL", "https://api.tokenfactory.nebius.com/v1/")
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_SERVICE_KEY: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+    CLOUD_WORKER_URL: str = os.getenv("CLOUD_WORKER_URL", "http://localhost:8000")
+    MODEL_NANO: str = "nvidia/nemotron-3-nano"
+    MODEL_ULTRA: str = "nvidia/nemotron-3-ultra"
+
+settings = Settings()
+
+
+--- FILE: backend/auth.py ---
+import os
+from fastapi import Header, HTTPException, status
+from supabase import create_client, Client
+from backend.config import settings
+
+supabase: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
+
+async def get_current_user(authorization: str = Header(...)) -> str:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format"
+        )
+    token = authorization.split(" ")[1]
+    try:
+        user_res = supabase.auth.get_user(token)
+        if not user_res or not user_res.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User session invalid or expired"
+            )
+        return str(user_res.user.id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token verification failed: {str(e)}"
+        )
+
+
+--- FILE: backend/agents/triage_agent.py ---
+import json
+import time
+from openai import OpenAI
+from backend.config import settings
+
+class TriageAgent:
+    def __init__(self, client: OpenAI):
+        self.client = client
+
+    def process(self, raw_manifest: str) -> tuple[dict, int]:
+        start = time.perf_counter()
+        prompt = (
+            "You are a logistics network extraction parser. Convert the following unstructured "
+            "delivery manifest, fleet coordinates, or stop list into a strict mathematical graph.\n"
+            "Output JSON only with keys:\n"
+            "  'nodes': list of integer IDs (0 to N-1)\n"
+            "  'edges': list of [u, v, weight] lists (undirected, weight is distance/cost)\n\n"
+            f"MANIFEST:\n{raw_manifest}"
+        )
+        response = self.client.chat.completions.create(
+            model=settings.MODEL_NANO,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. Do not wrap in markdown tags."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        data = json.loads(response.choices[0].message.content)
+        return data, latency_ms
+
+
+--- FILE: backend/agents/hamiltonian_agent.py ---
+import json
+import time
+from openai import OpenAI
+from backend.config import settings
+
+class HamiltonianAgent:
+    def __init__(self, client: OpenAI):
+        self.client = client
+
+    def process(self, graph_dict: dict) -> tuple[dict, int]:
+        start = time.perf_counter()
+        prompt = (
+            "You are a Quantum Operations Research Scientist specializing in QAOA formulations. "
+            "Given this graph representing vehicle routing stops, construct the cost Hamiltonian parameters "
+            "and suggest layer depth and angle priors to prevent barren plateaus.\n"
+            "Output JSON with keys:\n"
+            "  'p_layers': int (between 1 and 3)\n"
+            "  'gamma_init': float (between 0.1 and 1.5)\n"
+            "  'beta_init': float (between 0.1 and 1.5)\n"
+            "  'penalty_weight': float\n\n"
+            f"GRAPH:\n{json.dumps(graph_dict)}"
+        )
+        response = self.client.chat.completions.create(
+            model=settings.MODEL_ULTRA,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. Do not wrap in markdown tags."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        data = json.loads(response.choices[0].message.content)
+        return data, latency_ms
+
+
+--- FILE: backend/agents/solution_agent.py ---
+import json
+import time
+from openai import OpenAI
+from backend.config import settings
+
+class SolutionAgent:
+    def __init__(self, client: OpenAI):
+        self.client = client
+
+    def process(self, graph_dict: dict, bitstring: str) -> tuple[dict, int]:
+        start = time.perf_counter()
+        prompt = (
+            "Map the following optimal bitstring resulting from a quantum QAOA simulation "
+            "back to vehicle routes, node partitions, and operational instructions.\n"
+            f"GRAPH: {json.dumps(graph_dict)}\n"
+            f"BITSTRING: {bitstring}\n\n"
+            "Output JSON with keys:\n"
+            "  'routes': list of lists of node IDs per vehicle\n"
+            "  'mileage_savings_pct': float\n"
+            "  'summary': string explaining route allocation"
+        )
+        response = self.client.chat.completions.create(
+            model=settings.MODEL_NANO,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only. Do not wrap in markdown tags."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1
+        )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        data = json.loads(response.choices[0].message.content)
+        return data, latency_ms
+
+
+--- FILE: backend/solvers/cloud_runner.py ---
+import requests
+import time
+from backend.config import settings
+
+def run_cloud_qaoa(graph_dict: dict, hamiltonian_spec: dict) -> tuple[dict, int]:
+    start = time.perf_counter()
+    payload = {
+        "nodes": graph_dict["nodes"],
+        "edges": graph_dict["edges"],
+        "p_layers": hamiltonian_spec.get("p_layers", 1),
+        "gamma_init": hamiltonian_spec.get("gamma_init", 0.5),
+        "beta_init": hamiltonian_spec.get("beta_init", 0.5)
+    }
+    res = requests.post(f"{settings.CLOUD_WORKER_URL}/solve", json=payload, timeout=60)
+    res.raise_for_status()
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    return res.json(), latency_ms
+
+
+--- FILE: backend/main.py ---
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+from openai import OpenAI
+from backend.config import settings
+from backend.auth import get_current_user, supabase
+from backend.agents.triage_agent import TriageAgent
+from backend.agents.hamiltonian_agent import HamiltonianAgent
+from backend.agents.solution_agent import SolutionAgent
+from backend.solvers.cloud_runner import run_cloud_qaoa
+
+app = FastAPI(title="Quantum Dispatch Gateway")
+
+nebius_client = OpenAI(
+    api_key=settings.NEBIUS_API_KEY,
+    base_url=settings.NEBIUS_BASE_URL
+)
+
+triage_agent = TriageAgent(nebius_client)
+hamiltonian_agent = HamiltonianAgent(nebius_client)
+solution_agent = SolutionAgent(nebius_client)
+
+class CreateDispatchRequest(BaseModel):
+    title: str
+    manifest_text: str
+    compute_target: str  # "LOCAL_GPU" or "NEBIUS_CLOUD"
+
+class CompleteLocalRequest(BaseModel):
+    bitstring: str
+    solver_latency_ms: int
+    energy: float
+
+@app.post("/api/v1/dispatch/create")
+async def create_dispatch(req: CreateDispatchRequest, user_id: str = Depends(get_current_user)):
+    insert_res = supabase.table("dispatch_runs").insert({
+        "user_id": user_id,
+        "title": req.title,
+        "status": "RUNNING",
+        "compute_target": req.compute_target,
+        "raw_payload": {"manifest": req.manifest_text}
+    }).execute()
+    run_id = insert_res.data[0]["id"]
+
+    try:
+        graph_dict, nano_triage_ms = triage_agent.process(req.manifest_text)
+        hamiltonian_spec, ultra_ms = hamiltonian_agent.process(graph_dict)
+
+        supabase.table("dispatch_runs").update({
+            "graph_data": graph_dict,
+            "hamiltonian_spec": hamiltonian_spec,
+            "telemetry": {
+                "triage_ms": nano_triage_ms,
+                "hamiltonian_ms": ultra_ms
+            }
+        }).eq("id", run_id).execute()
+
+        if req.compute_target == "LOCAL_GPU":
+            return {
+                "run_id": run_id,
+                "status": "DELEGATE_LOCAL",
+                "graph_data": graph_dict,
+                "hamiltonian_spec": hamiltonian_spec,
+                "telemetry": {
+                    "triage_ms": nano_triage_ms,
+                    "hamiltonian_ms": ultra_ms
+                }
+            }
+        else:
+            solver_res, solver_ms = run_cloud_qaoa(graph_dict, hamiltonian_spec)
+            bitstring = solver_res["best_bitstring"]
+            solution_data, decode_ms = solution_agent.process(graph_dict, bitstring)
+
+            total_telemetry = {
+                "triage_ms": nano_triage_ms,
+                "hamiltonian_ms": ultra_ms,
+                "solver_ms": solver_ms,
+                "decode_ms": decode_ms,
+                "energy": solver_res.get("energy", 0.0)
+            }
+
+            supabase.table("dispatch_runs").update({
+                "status": "COMPLETED",
+                "optimal_bitstring": bitstring,
+                "solution_json": solution_data,
+                "telemetry": total_telemetry
+            }).eq("id", run_id).execute()
+
+            return {
+                "run_id": run_id,
+                "status": "COMPLETED",
+                "bitstring": bitstring,
+                "solution": solution_data,
+                "telemetry": total_telemetry
+            }
+    except Exception as e:
+        supabase.table("dispatch_runs").update({
+            "status": "FAILED",
+            "telemetry": {"error": str(e)}
+        }).eq("id", run_id).execute()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/dispatch/{run_id}/complete_local")
+async def complete_local(run_id: str, req: CompleteLocalRequest, user_id: str = Depends(get_current_user)):
+    run_res = supabase.table("dispatch_runs").select("*").eq("id", run_id).eq("user_id", user_id).execute()
+    if not run_res.data:
+        raise HTTPException(status_code=404, detail="Run not found")
+    
+    run_record = run_res.data[0]
+    graph_dict = run_record["graph_data"]
+    solution_data, decode_ms = solution_agent.process(graph_dict, req.bitstring)
+
+    existing_telemetry = run_record.get("telemetry") or {}
+    existing_telemetry["solver_ms"] = req.solver_latency_ms
+    existing_telemetry["decode_ms"] = decode_ms
+    existing_telemetry["energy"] = req.energy
+
+    supabase.table("dispatch_runs").update({
+        "status": "COMPLETED",
+        "optimal_bitstring": req.bitstring,
+        "solution_json": solution_data,
+        "telemetry": existing_telemetry
+    }).eq("id", run_id).execute()
+
+    return {"status": "SUCCESS", "solution": solution_data, "telemetry": existing_telemetry}
+
+
+================================================================================
+SECTION 4: CUDA-Q SOLVER & CLOUD WORKER
+================================================================================
+
+--- FILE: backend/solvers/local_cudaq.py ---
+import sys
+import json
+import time
+import networkx as nx
+import cudaq
+
+def run_solver(graph_data: dict, p_layers: int, gamma_init: float, beta_init: float):
+    start_time = time.perf_counter()
+
+    try:
+        cudaq.set_target("nvidia")
+    except Exception:
+        cudaq.set_target("default")
+
+    G = nx.Graph()
+    for u, v, w in graph_data["edges"]:
+        G.add_edge(int(u), int(v), weight=float(w))
+
+    num_qubits = len(graph_data["nodes"])
+    p = p_layers
+
+    hamiltonian = 0
+    for u, v, data in G.edges(data=True):
+        w = data.get("weight", 1.0)
+        hamiltonian += 0.5 * w * (cudaq.spin.i - cudaq.spin.z(u) * cudaq.spin.z(v))
+
+    @cudaq.kernel
+    def qaoa_kernel(qubit_count: int, layers: int, thetas: list[float]):
+        qreg = cudaq.qvector(qubit_count)
+        h(qreg)
+        for l in range(layers):
+            gamma = thetas[l]
+            beta = thetas[l + layers]
+            for edge_idx, (u, v) in enumerate(G.edges()):
+                cx(qreg[u], qreg[v])
+                rz(2.0 * gamma, qreg[v])
+                cx(qreg[u], qreg[v])
+            for q in range(qubit_count):
+                rx(2.0 * beta, qreg[q])
+
+    optimizer = cudaq.optimizers.NelderMead()
+    initial_thetas = [gamma_init] * p + [beta_init] * p
+
+    def objective(params):
+        return -cudaq.observe(qaoa_kernel, hamiltonian, num_qubits, p, params).expectation()
+
+    _, opt_thetas = optimizer.optimize(dimensions=2 * p, function=objective)
+    counts = cudaq.sample(qaoa_kernel, num_qubits, p, opt_thetas, shots_count=1000)
+
+    latency_ms = int((time.perf_counter() - start_time) * 1000)
+
+    return {
+        "status": "success",
+        "best_bitstring": counts.most_probable(),
+        "energy": float(objective(opt_thetas)),
+        "solver_latency_ms": latency_ms,
+        "target": cudaq.get_target().name
+    }
+
+if __name__ == "__main__":
+    raw_in = sys.stdin.read()
+    payload = json.loads(raw_in)
+    res = run_solver(
+        payload["graph_data"],
+        payload.get("p_layers", 1),
+        payload.get("gamma_init", 0.5),
+        payload.get("beta_init", 0.5)
+    )
+    print(json.dumps(res))
+
+
+--- FILE: backend/worker.py ---
+from fastapi import FastAPI
+from pydantic import BaseModel
+import networkx as nx
+import cudaq
+import time
+
+app = FastAPI(title="Nebius CUDA-Q Cloud Worker")
+
+try:
+    cudaq.set_target("nvidia")
+except Exception:
+    cudaq.set_target("default")
+
+class SolveRequest(BaseModel):
+    nodes: list[int]
+    edges: list[list[float]]
+    p_layers: int = 1
+    gamma_init: float = 0.5
+    beta_init: float = 0.5
+
+@app.post("/solve")
+def solve(req: SolveRequest):
+    start = time.perf_counter()
+    G = nx.Graph()
+    for u, v, w in req.edges:
+        G.add_edge(int(u), int(v), weight=float(w))
+
+    num_qubits = len(req.nodes)
+    p = req.p_layers
+
+    hamiltonian = 0
+    for u, v, data in G.edges(data=True):
+        w = data.get("weight", 1.0)
+        hamiltonian += 0.5 * w * (cudaq.spin.i - cudaq.spin.z(u) * cudaq.spin.z(v))
+
+    @cudaq.kernel
+    def qaoa_kernel(qubit_count: int, layers: int, thetas: list[float]):
+        qreg = cudaq.qvector(qubit_count)
+        h(qreg)
+        for l in range(layers):
+            gamma = thetas[l]
+            beta = thetas[l + layers]
+            for edge_idx, (u, v) in enumerate(G.edges()):
+                cx(qreg[u], qreg[v])
+                rz(2.0 * gamma, qreg[v])
+                cx(qreg[u], qreg[v])
+            for q in range(qubit_count):
+                rx(2.0 * beta, qreg[q])
+
+    optimizer = cudaq.optimizers.NelderMead()
+    initial_thetas = [req.gamma_init] * p + [req.beta_init] * p
+
+    def objective(params):
+        return -cudaq.observe(qaoa_kernel, hamiltonian, num_qubits, p, params).expectation()
+
+    _, opt_thetas = optimizer.optimize(dimensions=2 * p, function=objective)
+    counts = cudaq.sample(qaoa_kernel, num_qubits, p, opt_thetas, shots_count=1000)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+
+    return {
+        "status": "success",
+        "best_bitstring": counts.most_probable(),
+        "energy": float(objective(opt_thetas)),
+        "solver_latency_ms": latency_ms,
+        "target": cudaq.get_target().name
+    }
+
+
+--- FILE: docker/Dockerfile.cloud-worker ---
+FROM ghcr.io/nvidia/cuda-quantum:latest
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    fastapi \
+    uvicorn \
+    networkx \
+    numpy \
+    pydantic
+
+COPY backend/worker.py /app/backend/worker.py
+
+EXPOSE 8000
+
+CMD ["uvicorn", "backend.worker:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
+================================================================================
+SECTION 5: NATIVE C++20 / QT6 DESKTOP GUI
+================================================================================
+
+--- FILE: gui/include/auth_dialog.hpp ---
+#pragma once
+#include <QDialog>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QNetworkAccessManager>
+
+class AuthDialog : public QDialog {
+    Q_OBJECT
+public:
+    explicit AuthDialog(const QString& supabaseUrl, const QString& anonKey, QWidget* parent = nullptr);
+    QString getToken() const;
+    QString getEmail() const;
+
+private slots:
+    void handleLogin();
+    void handleRegister();
+
+private:
+    QString supabaseUrl;
+    QString anonKey;
+    QString jwtToken;
+    QString userEmail;
+    QLineEdit* emailEdit;
+    QLineEdit* passwordEdit;
+    QPushButton* loginBtn;
+    QPushButton* registerBtn;
+    QNetworkAccessManager* net;
+
+    void performAuth(const QString& endpoint);
+};
+
+
+--- FILE: gui/src/auth_dialog.cpp ---
+#include "auth_dialog.hpp"
+#include <QVBoxLayout>
+#include <QLabel>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMessageBox>
+
+AuthDialog::AuthDialog(const QString& url, const QString& key, QWidget* parent)
+    : QDialog(parent), supabaseUrl(url), anonKey(key), net(new QNetworkAccessManager(this)) {
+    setWindowTitle("Supabase Cloud Authentication");
+    resize(360, 200);
+
+    auto* layout = new QVBoxLayout(this);
+    emailEdit = new QLineEdit(this);
+    emailEdit->setPlaceholderText("Email address");
+    passwordEdit = new QLineEdit(this);
+    passwordEdit->setPlaceholderText("Password");
+    passwordEdit->setEchoMode(QLineEdit::Password);
+
+    loginBtn = new QPushButton("Log In", this);
+    registerBtn = new QPushButton("Register", this);
+
+    layout->addWidget(new QLabel("Sign in to sync runs across devices:"));
+    layout->addWidget(emailEdit);
+    layout->addWidget(passwordEdit);
+    layout->addWidget(loginBtn);
+    layout->addWidget(registerBtn);
+
+    connect(loginBtn, &QPushButton::clicked, this, &AuthDialog::handleLogin);
+    connect(registerBtn, &QPushButton::clicked, this, &AuthDialog::handleRegister);
+}
+
+QString AuthDialog::getToken() const { return jwtToken; }
+QString AuthDialog::getEmail() const { return userEmail; }
+
+void AuthDialog::handleLogin() { performAuth("/auth/v1/token?grant_type=password"); }
+void AuthDialog::handleRegister() { performAuth("/auth/v1/signup"); }
+
+void AuthDialog::performAuth(const QString& endpoint) {
+    QUrl url(supabaseUrl + endpoint);
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("apikey", anonKey.toUtf8());
+
+    QJsonObject body;
+    body["email"] = emailEdit->text().trimmed();
+    body["password"] = passwordEdit->text();
+
+    QNetworkReply* reply = net->post(request, QJsonDocument(body).toJson());
+    connect(reply, &QNetworkReply::finished, [this, reply]() {
+        if (reply->error() == QNetworkReply::NoError) {
+            auto doc = QJsonDocument::fromJson(reply->readAll());
+            jwtToken = doc.object()["access_token"].toString();
+            userEmail = emailEdit->text().trimmed();
+            QMessageBox::information(this, "Success", "Authenticated successfully.");
+            accept();
+        } else {
+            QMessageBox::warning(this, "Authentication Failed", reply->readAll());
+        }
+        reply->deleteLater();
+    });
+}
+
+
+--- FILE: gui/include/cloud_sync.hpp ---
+#pragma once
+#include <QObject>
+#include <QNetworkAccessManager>
+#include <QJsonObject>
+
+class CloudSyncClient : public QObject {
+    Q_OBJECT
+public:
+    explicit CloudSyncClient(const QString& gatewayUrl, QObject* parent = nullptr);
+    void setToken(const QString& token);
+    void createDispatch(const QString& title, const QString& manifest, const QString& target);
+    void completeLocalRun(const QString& runId, const QString& bitstring, int latencyMs, double energy);
+
+signals:
+    void dispatchCreated(const QJsonObject& data);
+    void localRunCompleted(const QJsonObject& data);
+    void errorOccurred(const QString& message);
+
+private:
+    QString gatewayUrl;
+    QString token;
+    QNetworkAccessManager* net;
+};
+
+
+--- FILE: gui/src/cloud_sync.cpp ---
+#include "cloud_sync.hpp"
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QJsonDocument>
+
+CloudSyncClient::CloudSyncClient(const QString& url, QObject* parent)
+    : QObject(parent), gatewayUrl(url), net(new QNetworkAccessManager(this)) {}
+
+void CloudSyncClient::setToken(const QString& t) { token = t; }
+
+void CloudSyncClient::createDispatch(const QString& title, const QString& manifest, const QString& target) {
+    QNetworkRequest req(QUrl(gatewayUrl + "/api/v1/dispatch/create"));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
+
+    QJsonObject body;
+    body["title"] = title;
+    body["manifest_text"] = manifest;
+    body["compute_target"] = target;
+
+    QNetworkReply* reply = net->post(req, QJsonDocument(body).toJson());
+    connect(reply, &QNetworkReply::finished, [this, reply]() {
+        if (reply->error() == QNetworkReply::NoError) {
+            emit dispatchCreated(QJsonDocument::fromJson(reply->readAll()).object());
+        } else {
+            emit errorOccurred("Dispatch creation failed: " + reply->errorString());
+        }
+        reply->deleteLater();
+    });
+}
+
+void CloudSyncClient::completeLocalRun(const QString& runId, const QString& bitstring, int latencyMs, double energy) {
+    QNetworkRequest req(QUrl(gatewayUrl + "/api/v1/dispatch/" + runId + "/complete_local"));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setRawHeader("Authorization", ("Bearer " + token).toUtf8());
+
+    QJsonObject body;
+    body["bitstring"] = bitstring;
+    body["solver_latency_ms"] = latencyMs;
+    body["energy"] = energy;
+
+    QNetworkReply* reply = net->post(req, QJsonDocument(body).toJson());
+    connect(reply, &QNetworkReply::finished, [this, reply]() {
+        if (reply->error() == QNetworkReply::NoError) {
+            emit localRunCompleted(QJsonDocument::fromJson(reply->readAll()).object());
+        } else {
+            emit errorOccurred("Failed syncing local run: " + reply->errorString());
+        }
+        reply->deleteLater();
+    });
+}
+
+
+--- FILE: gui/include/local_runner.hpp ---
+#pragma once
+#include <QObject>
+#include <QProcess>
+#include <QJsonObject>
+
+class LocalRunner : public QObject {
+    Q_OBJECT
+public:
+    explicit LocalRunner(QObject* parent = nullptr);
+    void runQAOA(const QJsonObject& graphData, int pLayers, double gamma, double beta);
+
+signals:
+    void finished(const QJsonObject& result);
+    void error(const QString& err);
+
+private:
+    QProcess* process;
+};
+
+
+--- FILE: gui/src/local_runner.cpp ---
+#include "local_runner.hpp"
+#include <QJsonDocument>
+
+LocalRunner::LocalRunner(QObject* parent) : QObject(parent), process(new QProcess(this)) {
+    connect(process, &QProcess::finished, [this](int exitCode, QProcess::ExitStatus) {
+        if (exitCode == 0) {
+            auto out = process->readAllStandardOutput();
+            emit finished(QJsonDocument::fromJson(out).object());
+        } else {
+            emit error(process->readAllStandardError());
+        }
+    });
+}
+
+void LocalRunner::runQAOA(const QJsonObject& graphData, int pLayers, double gamma, double beta) {
+    QJsonObject payload;
+    payload["graph_data"] = graphData;
+    payload["p_layers"] = pLayers;
+    payload["gamma_init"] = gamma;
+    payload["beta_init"] = beta;
+
+    QString scriptPath = "backend/solvers/local_cudaq.py";
+    process->start("python3", QStringList() << scriptPath);
+    process->write(QJsonDocument(payload).toJson());
+    process->closeWriteChannel();
+}
+
+
+--- FILE: gui/include/main_window.hpp ---
+#pragma once
+#include <QMainWindow>
+#include <QTextEdit>
+#include <QRadioButton>
+#include <QPushButton>
+#include <QTableWidget>
+#include <QLabel>
+#include "cloud_sync.hpp"
+#include "local_runner.hpp"
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    explicit MainWindow(QWidget* parent = nullptr);
+
+private slots:
+    void onExecuteClicked();
+    void onDispatchCreated(const QJsonObject& data);
+    void onLocalSolverFinished(const QJsonObject& res);
+    void onSyncFinished(const QJsonObject& data);
+    void appendLog(const QString& tag, const QString& msg);
+
+private:
+    CloudSyncClient* syncClient;
+    LocalRunner* localRunner;
+    QString currentRunId;
+
+    QTextEdit* manifestInput;
+    QRadioButton* localGpuRadio;
+    QRadioButton* cloudGpuRadio;
+    QPushButton* executeBtn;
+    QTextEdit* logConsole;
+    QTableWidget* metricsTable;
+    QLabel* userStatusLabel;
+
+    void setupUi();
+};
+
+
+--- FILE: gui/src/main_window.cpp ---
+#include "main_window.hpp"
+#include "auth_dialog.hpp"
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QSplitter>
+#include <QHeaderView>
+#include <QDateTime>
+
+MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    setupUi();
+    syncClient = new CloudSyncClient("http://localhost:8765", this);
+    localRunner = new LocalRunner(this);
+
+    connect(syncClient, &CloudSyncClient::dispatchCreated, this, &MainWindow::onDispatchCreated);
+    connect(syncClient, &CloudSyncClient::localRunCompleted, this, &MainWindow::onSyncFinished);
+    connect(localRunner, &LocalRunner::finished, this, &MainWindow::onLocalSolverFinished);
+
+    AuthDialog authDlg("https://your-project.supabase.co", "your_anon_key", this);
+    if (authDlg.exec() == QDialog::Accepted) {
+        syncClient->setToken(authDlg.getToken());
+        userStatusLabel->setText("Connected: " + authDlg.getEmail());
+    } else {
+        userStatusLabel->setText("Running in Guest / Unauthenticated Mode");
+    }
+}
+
+void MainWindow::setupUi() {
+    resize(1024, 720);
+    setWindowTitle("Quantum-Classical Fleet Dispatch Optimizer (NVIDIA & Nebius)");
+
+    auto* central = new QWidget(this);
+    setCentralWidget(central);
+    auto* mainLayout = new QVBoxLayout(central);
+
+    userStatusLabel = new QLabel(this);
+    mainLayout->addWidget(userStatusLabel);
+
+    auto* splitter = new QSplitter(Qt::Horizontal, this);
+    mainLayout->addWidget(splitter);
+
+    // Left Control Panel
+    auto* leftWidget = new QWidget(this);
+    auto* leftLayout = new QVBoxLayout(leftWidget);
+    manifestInput = new QTextEdit(this);
+    manifestInput->setPlaceholderText("Paste unstructured delivery manifest or stop coordinates here...");
+
+    localGpuRadio = new QRadioButton("Local NVIDIA GPU (CUDA-Q)", this);
+    cloudGpuRadio = new QRadioButton("Nebius Cloud Worker (Serverless GPU)", this);
+    localGpuRadio->setChecked(true);
+
+    executeBtn = new QPushButton("Run Quantum-Classical Dispatch", this);
+
+    leftLayout->addWidget(new QLabel("Input Delivery Manifest:"));
+    leftLayout->addWidget(manifestInput);
+    leftLayout->addWidget(new QLabel("Compute Backend:"));
+    leftLayout->addWidget(localGpuRadio);
+    leftLayout->addWidget(cloudGpuRadio);
+    leftLayout->addWidget(executeBtn);
+    splitter->addWidget(leftWidget);
+
+    // Right Telemetry Panel
+    auto* rightWidget = new QWidget(this);
+    auto* rightLayout = new QVBoxLayout(rightWidget);
+    logConsole = new QTextEdit(this);
+    logConsole->setReadOnly(true);
+
+    metricsTable = new QTableWidget(5, 2, this);
+    metricsTable->setHorizontalHeaderLabels(QStringList() << "Metric" << "Value");
+    metricsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    metricsTable->setItem(0, 0, new QTableWidgetItem("Triage Time (Nano)"));
+    metricsTable->setItem(1, 0, new QTableWidgetItem("Hamiltonian Time (Ultra)"));
+    metricsTable->setItem(2, 0, new QTableWidgetItem("Solver Time (CUDA-Q)"));
+    metricsTable->setItem(3, 0, new QTableWidgetItem("Ground Energy"));
+    metricsTable->setItem(4, 0, new QTableWidgetItem("Best Bitstring"));
+
+    rightLayout->addWidget(new QLabel("Execution Pipeline Telemetry:"));
+    rightLayout->addWidget(logConsole);
+    rightLayout->addWidget(metricsTable);
+    splitter->addWidget(rightWidget);
+
+    connect(executeBtn, &QPushButton::clicked, this, &MainWindow::onExecuteClicked);
+}
+
+void MainWindow::appendLog(const QString& tag, const QString& msg) {
+    QString timeStr = QDateTime::currentDateTime().toString("hh:mm:ss.zzz");
+    logConsole->append(QString("[%1] <b>%2</b>: %3").arg(timeStr, tag, msg));
+}
+
+void MainWindow::onExecuteClicked() {
+    QString target = localGpuRadio->isChecked() ? "LOCAL_GPU" : "NEBIUS_CLOUD";
+    appendLog("SYSTEM", "Initiating run targeting " + target);
+    syncClient->createDispatch("Fleet Optimization Run", manifestInput->toPlainText(), target);
+}
+
+void MainWindow::onDispatchCreated(const QJsonObject& data) {
+    currentRunId = data["run_id"].toString();
+    appendLog("GATEWAY", "Run registered with ID: " + currentRunId);
+
+    auto telem = data["telemetry"].toObject();
+    metricsTable->setItem(0, 1, new QTableWidgetItem(QString::number(telem["triage_ms"].toInt()) + " ms"));
+    metricsTable->setItem(1, 1, new QTableWidgetItem(QString::number(telem["hamiltonian_ms"].toInt()) + " ms"));
+
+    if (data["status"].toString() == "DELEGATE_LOCAL") {
+        appendLog("LOCAL_CUDA-Q", "Starting QAOA state-vector on local NVIDIA hardware...");
+        auto hSpec = data["hamiltonian_spec"].toObject();
+        localRunner->runQAOA(
+            data["graph_data"].toObject(),
+            hSpec["p_layers"].toInt(),
+            hSpec["gamma_init"].toDouble(),
+            hSpec["beta_init"].toDouble()
+        );
+    } else {
+        onSyncFinished(data);
+    }
+}
+
+void MainWindow::onLocalSolverFinished(const QJsonObject& res) {
+    appendLog("LOCAL_CUDA-Q", "Simulation finished. Bitstring: " + res["best_bitstring"].toString());
+    metricsTable->setItem(2, 1, new QTableWidgetItem(QString::number(res["solver_latency_ms"].toInt()) + " ms"));
+    metricsTable->setItem(3, 1, new QTableWidgetItem(QString::number(res["energy"].toDouble())));
+    metricsTable->setItem(4, 1, new QTableWidgetItem(res["best_bitstring"].toString()));
+
+    appendLog("SYNC", "Uploading local metrics to Supabase cloud account...");
+    syncClient->completeLocalRun(
+        currentRunId,
+        res["best_bitstring"].toString(),
+        res["solver_latency_ms"].toInt(),
+        res["energy"].toDouble()
+    );
+}
+
+void MainWindow::onSyncFinished(const QJsonObject& data) {
+    appendLog("SYNC", "Run synchronized successfully across all authenticated devices.");
+}
+
+
+--- FILE: gui/src/main.cpp ---
+#include <QApplication>
+#include "main_window.hpp"
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    MainWindow window;
+    window.show();
+    return app.exec();
+}
+
+
+================================================================================
+SECTION 6: PURE CLOUD NEXT.JS 14 WEB APPLICATION
+================================================================================
+
+--- FILE: web/package.json ---
+{
+  "name": "quantum-dispatch-web",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "leaflet": "^1.9.4",
+    "lucide-react": "^0.441.0",
+    "next": "14.2.13",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.12",
+    "@types/node": "^20.16.5",
+    "@types/react": "^18.3.5",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.11",
+    "typescript": "^5.6.2"
+  }
+}
+
+
+--- FILE: web/lib/supabase.ts ---
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+
+--- FILE: web/app/layout.tsx ---
+import type { Metadata } from 'next';
+import './globals.css';
+
+export const metadata: Metadata = {
+  title: 'Quantum-Classical Dispatch | Nebius & CUDA-Q',
+  description: 'Hybrid quantum logistics platform',
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <body className="bg-slate-950 text-slate-100 min-h-screen">
+        {children}
+      </body>
+    </html>
+  );
+}
+
+
+--- FILE: web/app/(auth)/login/page.tsx ---
+'use client';
+import { useState } from 'react';
+import { supabase } from '@/lib/supabase';
+import { useRouter } from 'next/navigation';
+
+export default function LoginPage() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const router = useRouter();
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) alert(error.message);
+    else router.push('/dashboard');
+    setLoading(false);
+  };
+
+  return (
+    <div className="flex items-center justify-center min-h-screen">
+      <form onSubmit={handleLogin} className="p-8 bg-slate-900 rounded-lg w-96 border border-slate-800">
+        <h1 className="text-xl font-bold mb-4">Dispatcher Login</h1>
+        <input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          className="w-full p-2 mb-3 bg-slate-800 rounded border border-slate-700"
+          required
+        />
+        <input
+          type="password"
+          placeholder="Password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="w-full p-2 mb-4 bg-slate-800 rounded border border-slate-700"
+          required
+        />
+        <button
+          type="submit"
+          disabled={loading}
+          className="w-full p-2 bg-emerald-600 hover:bg-emerald-500 rounded font-semibold"
+        >
+          {loading ? 'Authenticating...' : 'Sign In'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+
+--- FILE: web/app/dashboard/page.tsx ---
+'use client';
+import { useEffect, useState } from 'react';
+import { supabase } from '@/lib/supabase';
+import Link from 'next/navigation';
+
+export default function DashboardPage() {
+  const [runs, setRuns] = useState<any[]>([]);
+
+  useEffect(() => {
+    async function loadRuns() {
+      const { data } = await supabase
+        .from('dispatch_runs')
+        .select('*')
+        .order('created_at', { ascending: false });
+      if (data) setRuns(data);
+    }
+    loadRuns();
+  }, []);
+
+  return (
+    <div className="p-8 max-w-6xl mx-auto">
+      <h1 className="text-2xl font-bold mb-6">Dispatch History & Active Runs</h1>
+      <div className="bg-slate-900 rounded border border-slate-800 overflow-hidden">
+        <table className="w-full text-left">
+          <thead className="bg-slate-800 text-slate-400">
+            <tr>
+              <th className="p-3">Title</th>
+              <th className="p-3">Target</th>
+              <th className="p-3">Status</th>
+              <th className="p-3">Optimal Bitstring</th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((r) => (
+              <tr key={r.id} className="border-t border-slate-800">
+                <td className="p-3 font-medium">{r.title}</td>
+                <td className="p-3">{r.compute_target}</td>
+                <td className="p-3">
+                  <span className={`px-2 py-1 rounded text-xs ${
+                    r.status === 'COMPLETED' ? 'bg-emerald-900 text-emerald-300' : 'bg-amber-900 text-amber-300'
+                  }`}>
+                    {r.status}
+                  </span>
+                </td>
+                <td className="p-3 font-mono">{r.optimal_bitstring || 'N/A'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+SECTION 7: VERIFICATION & TESTS
+================================================================================
+
+--- FILE: backend/tests/test_pipeline.py ---
+import pytest
+from backend.agents.triage_agent import TriageAgent
+from backend.agents.hamiltonian_agent import HamiltonianAgent
+
+class MockChatChoice:
+    def __init__(self, content):
+        self.message = type('obj', (object,), {'content': content})
+
+class MockChatResponse:
+    def __init__(self, content):
+        self.choices = [MockChatChoice(content)]
+
+class MockOpenAIClient:
+    def __init__(self, return_content):
+        self.return_content = return_content
+        self.chat = type('obj', (object,), {
+            'completions': type('obj', (object,), {
+                'create': lambda **kwargs: MockChatResponse(self.return_content)
+            })
+        })
+
+def test_triage_agent():
+    mock_payload = '{"nodes": [0, 1], "edges": [[0, 1, 4.5]]}'
+    agent = TriageAgent(MockOpenAIClient(mock_payload))
+    data, lat = agent.process("Route between stop 0 and 1 dist 4.5")
+    assert "nodes" in data
+    assert len(data["nodes"]) == 2
+
+def test_hamiltonian_agent():
+    mock_payload = '{"p_layers": 1, "gamma_init": 0.5, "beta_init": 0.5, "penalty_weight": 2.0}'
+    agent = HamiltonianAgent(MockOpenAIClient(mock_payload))
+    data, lat = agent.process({"nodes": [0, 1], "edges": [[0, 1, 1.0]]})
+    assert data["p_layers"] == 1
+    assert data["gamma_init"] == 0.5
